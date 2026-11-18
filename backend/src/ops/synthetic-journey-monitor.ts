@@ -323,9 +323,10 @@ export class SyntheticJourneyMonitor {
       };
     } finally {
       // Automatic synthetic data cleanup if storage supports deletion
-      if (createdInvoice && typeof (this.storage as any).deleteInvoice === 'function') {
+      const invoiceToClean = createdInvoice as StoredInvoice | null;
+      if (invoiceToClean && typeof (this.storage as any).deleteInvoice === 'function') {
         try {
-          await (this.storage as any).deleteInvoice(createdInvoice.id);
+          await (this.storage as any).deleteInvoice(invoiceToClean.id);
         } catch {
           // Cleanup error must not mask journey results
         }
