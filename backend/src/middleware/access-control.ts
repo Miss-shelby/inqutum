@@ -6,7 +6,9 @@ import { SESSION_TOKEN_PREFIX } from '../../../shared/wallet-auth';
 import { ANONYMOUS_ACTOR } from '../auth/actor';
 import type { Actor } from '../auth/actor';
 import { digestToken, loadAuthConfig } from '../auth/config';
+import { defaultRevocationStore, SessionRevocationStore } from '../auth/revocation-store';
 import { verifySessionToken } from '../auth/session-token';
+import type { SessionClaims } from '../auth/session-token';
 import { sendFailure } from '../types/api';
 
 // Authentication answers "who is calling"; authorization answers "may they".
@@ -23,7 +25,8 @@ declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
-      authFailure?: 'malformed' | 'expired_or_invalid' | 'sessions_unavailable';
+      authFailure?: 'malformed' | 'expired_or_invalid' | 'sessions_unavailable' | 'token_revoked' | 'session_stale';
+      sessionClaims?: SessionClaims;
     }
   }
 }
@@ -41,16 +44,20 @@ function matchesAny(presented: Buffer, digests: Buffer[]): number {
 export function actorFromBearer(
   token: string,
   env: Env = process.env,
-  nowMs: number = Date.now()
-): { actor: Actor } | { failure: NonNullable<Request['authFailure']> } {
+  nowMs: number = Date.now(),
+  revocationStore: SessionRevocationStore = defaultRevocationStore
+): { actor: Actor; sessionClaims?: SessionClaims } | { failure: NonNullable<Request['authFailure']> } {
   const config = loadAuthConfig(env);
 
   if (token.startsWith(`${SESSION_TOKEN_PREFIX}.`)) {
     if (!config.sessionSecret) return { failure: 'sessions_unavailable' };
     const claims = verifySessionToken(config.sessionSecret, token, nowMs);
-    return claims
-      ? { actor: { role: 'end_user', wallet: claims.sub, subject: claims.sub } }
-      : { failure: 'expired_or_invalid' };
+    if (!claims) return { failure: 'expired_or_invalid' };
+
+    const check = revocationStore.checkSession(claims, nowMs);
+    if (!check.valid) return { failure: check.reason };
+
+    return { actor: { role: 'end_user', wallet: claims.sub, subject: claims.sub }, sessionClaims: claims };
   }
 
   const presented = digestToken(token);
@@ -66,10 +73,14 @@ export function actorFromBearer(
 }
 
 /** Sets `req.actor` on every request; never rejects. */
-export function authenticate(env: () => Env = () => process.env): RequestHandler {
+export function authenticate(
+  env: () => Env = () => process.env,
+  revocationStore: SessionRevocationStore = defaultRevocationStore
+): RequestHandler {
   return (req: Request, _res: Response, next: NextFunction) => {
     req.actor = ANONYMOUS_ACTOR;
     req.authFailure = undefined;
+    req.sessionClaims = undefined;
 
     const header = req.headers.authorization;
     if (header === undefined) return next();
@@ -80,9 +91,13 @@ export function authenticate(env: () => Env = () => process.env): RequestHandler
       return next();
     }
 
-    const result = actorFromBearer(match[1], env());
-    if ('actor' in result) req.actor = result.actor;
-    else req.authFailure = result.failure;
+    const result = actorFromBearer(match[1], env(), Date.now(), revocationStore);
+    if ('actor' in result) {
+      req.actor = result.actor;
+      req.sessionClaims = result.sessionClaims;
+    } else {
+      req.authFailure = result.failure;
+    }
     next();
   };
 }
@@ -107,9 +122,13 @@ export function requirePermission(permission: Permission): PermissionGuard {
       const reason =
         req.authFailure === 'sessions_unavailable'
           ? 'Wallet sessions are not available on this server'
-          : req.authFailure
-            ? 'The credentials provided are invalid or have expired'
-            : 'Authentication required';
+          : req.authFailure === 'token_revoked'
+            ? 'The session token has been revoked'
+            : req.authFailure === 'session_stale'
+              ? 'The session is stale and must be re-authenticated'
+              : req.authFailure
+                ? 'The credentials provided are invalid or have expired'
+                : 'Authentication required';
       return sendFailure(res, 401, reason, { code: 'UNAUTHENTICATED' });
     }
     return sendFailure(res, 403, 'Your role is not permitted to perform this action', 'FORBIDDEN', {
