@@ -20,7 +20,7 @@
 
 import { Request, Response, NextFunction } from 'express';
 import { performance } from 'perf_hooks';
-import { sanitizeObject } from '../security/redaction';
+import { redactSensitiveText, sanitizeObject } from '../security/redaction';
 
 // Extend Express Request interface to carry correlationId & startTime
 declare global {
@@ -48,6 +48,62 @@ export interface StructuredLogEntry {
   metadata?: Record<string, any>;
 }
 
+export interface SamplingPolicy {
+  successSampleRate: number;
+  failureSampleRate: number;
+  maxLogsPerWindow?: number;
+  windowMs?: number;
+}
+
+export class TelemetryConfigError extends Error {
+  readonly code = 'INVALID_TELEMETRY_POLICY';
+  readonly httpStatus = 400;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'TelemetryConfigError';
+  }
+}
+
+export function validateSamplingPolicy(policy: Partial<SamplingPolicy>): SamplingPolicy {
+  const successSampleRate = policy.successSampleRate ?? 1.0;
+  const failureSampleRate = policy.failureSampleRate ?? 1.0;
+  if (!Number.isFinite(successSampleRate) || successSampleRate < 0 || successSampleRate > 1) {
+    throw new TelemetryConfigError('successSampleRate must be a number between 0 and 1');
+  }
+  if (!Number.isFinite(failureSampleRate) || failureSampleRate < 0 || failureSampleRate > 1) {
+    throw new TelemetryConfigError('failureSampleRate must be a number between 0 and 1');
+  }
+  if (policy.maxLogsPerWindow !== undefined && (!Number.isInteger(policy.maxLogsPerWindow) || policy.maxLogsPerWindow < 0)) {
+    throw new TelemetryConfigError('maxLogsPerWindow must be a non-negative integer');
+  }
+  if (policy.windowMs !== undefined && (!Number.isInteger(policy.windowMs) || policy.windowMs <= 0)) {
+    throw new TelemetryConfigError('windowMs must be a positive integer');
+  }
+  return {
+    successSampleRate,
+    failureSampleRate,
+    maxLogsPerWindow: policy.maxLogsPerWindow,
+    windowMs: policy.windowMs,
+  };
+}
+
+/**
+ * Deterministic FNV-1a 32-bit hash sampling on `correlationId` so retries
+ * sharing a correlation ID receive a consistent sampling decision.
+ */
+export function shouldSampleCorrelation(correlationId: string, rate: number): boolean {
+  if (rate >= 1) return true;
+  if (rate <= 0) return false;
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < correlationId.length; i++) {
+    hash ^= correlationId.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  const normalized = (hash >>> 0) / 0x1_0000_0000;
+  return normalized < rate;
+}
+
 /**
  * Recursively sanitize an object or string, masking sensitive cryptographic secrets
  * and credentials while preserving public identifiers (G-addresses, tx hashes, invoice IDs).
@@ -57,13 +113,54 @@ export function sanitizeForLogging(data: any): any {
 }
 
 /**
+ * Redact secrets and bound high-cardinality metadata objects (max keys, array length, string length).
+ */
+export function sanitizeTelemetryMetadata(
+  metadata: Record<string, any> | undefined,
+  maxKeys = 25,
+  maxStringLength = 256
+): Record<string, any> | undefined {
+  if (!metadata || typeof metadata !== 'object') return metadata;
+  const redacted = sanitizeObject(metadata) as Record<string, any>;
+  const boundValue = (val: unknown, depth: number): unknown => {
+    if (typeof val === 'string') {
+      return val.length > maxStringLength ? `${val.slice(0, maxStringLength)}...[truncated]` : val;
+    }
+    if (Array.isArray(val)) {
+      const sliced = val.slice(0, 20).map((item) => (depth < 3 ? boundValue(item, depth + 1) : '[depth_limit]'));
+      if (val.length > 20) sliced.push(`...(${val.length - 20} more)`);
+      return sliced;
+    }
+    if (val && typeof val === 'object' && !(val instanceof Date)) {
+      if (depth >= 3) return '[depth_limit]';
+      const out: Record<string, unknown> = {};
+      const entries = Object.entries(val);
+      for (const [k, v] of entries.slice(0, maxKeys)) {
+        out[k] = boundValue(v, depth + 1);
+      }
+      if (entries.length > maxKeys) {
+        out.__truncated_keys__ = entries.length - maxKeys;
+      }
+      return out;
+    }
+    return val;
+  };
+  return boundValue(redacted, 0) as Record<string, any>;
+}
+
+/**
  * Collapse high-cardinality, attacker-influenceable label segments (e.g. raw
- * unmatched URL paths) into a bounded, dashboard-friendly placeholder, so a
- * flood of distinct paths/codes cannot grow metric label sets unboundedly.
+ * unmatched URL paths, query strings, Stellar keys, UUIDs) into a bounded,
+ * dashboard-friendly placeholder, and scrub embedded secrets first.
  */
 export function sanitizeLabelValue(value: string, maxLength = 80): string {
   if (!value) return value;
-  const collapsed = value
+  const scrubbed = redactSensitiveText(value);
+  const collapsed = scrubbed
+    // Strip/collapse query strings that often carry high-cardinality tokens or params
+    .replace(/\?.*$/, '?<redacted>')
+    // Stellar public keys (G...)
+    .replace(/\bG[A-Z0-9]{55}\b/g, ':wallet')
     // UUID-like segments
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':id')
     // long hex/alphanumeric segments (hashes, keys, tokens embedded in a path)
@@ -184,6 +281,11 @@ export class MetricsRegistry {
   ]);
   private recentLogs: StructuredLogEntry[] = [];
   private readonly maxRecentLogs = 200;
+  private samplingPolicy: SamplingPolicy = { successSampleRate: 1.0, failureSampleRate: 1.0 };
+  private sampledCount = 0;
+  private droppedCount = 0;
+  private windowLogCount = 0;
+  private windowStartMs = Date.now();
   readonly startTime = Date.now();
 
   static getInstance(): MetricsRegistry {
@@ -191,6 +293,34 @@ export class MetricsRegistry {
       MetricsRegistry.instance = new MetricsRegistry();
     }
     return MetricsRegistry.instance;
+  }
+
+  setSamplingPolicy(policy: Partial<SamplingPolicy>): SamplingPolicy {
+    this.samplingPolicy = validateSamplingPolicy(policy);
+    return { ...this.samplingPolicy };
+  }
+
+  getSamplingPolicy(): SamplingPolicy {
+    return { ...this.samplingPolicy };
+  }
+
+  private evaluateSampling(correlationId: string, result: OperationResult, nowMs = Date.now()): boolean {
+    const rate = result === 'failure' ? this.samplingPolicy.failureSampleRate : this.samplingPolicy.successSampleRate;
+    if (!shouldSampleCorrelation(correlationId, rate)) {
+      return false;
+    }
+    if (this.samplingPolicy.maxLogsPerWindow !== undefined) {
+      const windowMs = this.samplingPolicy.windowMs ?? 60_000;
+      if (nowMs - this.windowStartMs >= windowMs) {
+        this.windowStartMs = nowMs;
+        this.windowLogCount = 0;
+      }
+      if (this.windowLogCount >= this.samplingPolicy.maxLogsPerWindow) {
+        return false;
+      }
+      this.windowLogCount++;
+    }
+    return true;
   }
 
   recordOperation(entry: {
@@ -204,25 +334,35 @@ export class MetricsRegistry {
     metadata?: Record<string, any>;
   }): void {
     const { operation, result, latency_ms, error_code } = entry;
+    const safeOperation = sanitizeLabelValue(operation);
+    const safeErrorCode = error_code ? sanitizeLabelValue(error_code) : undefined;
 
-    let stats = this.operationStats.get(operation);
+    let stats = this.operationStats.get(safeOperation);
     if (!stats) {
       stats = new OperationLatencyStats();
-      this.operationStats.set(operation, stats);
+      this.operationStats.set(safeOperation, stats);
     }
     stats.record(latency_ms, result === 'failure');
 
-    if (error_code) {
-      const errKey = `${operation}:${sanitizeLabelValue(error_code)}`;
+    if (safeErrorCode) {
+      const errKey = `${safeOperation}:${safeErrorCode}`;
       boundedIncrement(this.errorCounts, errKey, MetricsRegistry.MAX_METRIC_CARDINALITY);
     }
 
-    // Structured logging
+    if (!this.evaluateSampling(entry.correlation_id, result)) {
+      this.droppedCount++;
+      return;
+    }
+    this.sampledCount++;
+
+    // Structured logging with redaction and high-cardinality metadata bounding
     const logEntry: StructuredLogEntry = {
       timestamp: new Date().toISOString(),
       level: result === 'failure' ? 'warn' : 'info',
       ...entry,
-      metadata: sanitizeForLogging(entry.metadata),
+      operation: safeOperation,
+      error_code: safeErrorCode,
+      metadata: sanitizeTelemetryMetadata(entry.metadata),
     };
 
     this.addRecentLog(logEntry);
@@ -233,8 +373,8 @@ export class MetricsRegistry {
     } else {
       const tag = result === 'success' ? '⚡' : '⚠️';
       console.log(
-        `${tag} [${logEntry.timestamp}] [${logEntry.correlation_id}] ${entry.operation} (${entry.actor_type}) -> ${entry.result} (${latency_ms.toFixed(1)}ms)${
-          error_code ? ` [code: ${error_code}]` : ''
+        `${tag} [${logEntry.timestamp}] [${logEntry.correlation_id}] ${safeOperation} (${entry.actor_type}) -> ${entry.result} (${latency_ms.toFixed(1)}ms)${
+          safeErrorCode ? ` [code: ${safeErrorCode}]` : ''
         }`
       );
     }
@@ -303,6 +443,11 @@ export class MetricsRegistry {
         stages: funnel,
         conversion_percentages: conversionRates,
       },
+      telemetry_sampling: {
+        policy: this.getSamplingPolicy(),
+        sampled_count: this.sampledCount,
+        dropped_count: this.droppedCount,
+      },
     };
   }
 
@@ -365,6 +510,11 @@ export class MetricsRegistry {
     this.conversionFunnel.set('payment_initiated', 0);
     this.conversionFunnel.set('payment_verified', 0);
     this.recentLogs = [];
+    this.sampledCount = 0;
+    this.droppedCount = 0;
+    this.windowLogCount = 0;
+    this.windowStartMs = Date.now();
+    this.samplingPolicy = { successSampleRate: 1.0, failureSampleRate: 1.0 };
   }
 }
 

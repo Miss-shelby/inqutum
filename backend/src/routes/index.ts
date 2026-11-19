@@ -26,6 +26,7 @@ import { createDisputeRouter } from './dispute.routes';
 import { createRiskRouter } from './risk.routes';
 import { createFeeRouter } from './fee.routes';
 import { createImportRouter } from './import.routes';
+import { createMergeReviewRouter } from './merge-review.routes';
 import { createPaymentMonitorRouter } from './payment-monitor.routes';
 
 const router: Router = Router();
@@ -53,6 +54,9 @@ if (webhookRouter) router.use(webhookRouter);
 
 // Bulk import (issue #53). Dry run by default; opt in with dryRun: false.
 router.use(createImportRouter({ storage: postgresInvoiceStorage }));
+
+// Deterministic duplicate detection and merge review (#367)
+router.use(createMergeReviewRouter({ storage: postgresInvoiceStorage }));
 
 // Email delivery & queue routes
 router.use(createQuotaRouter());
